@@ -1,0 +1,6 @@
+train: /Users/jackyzhang/ClassTranscribeOCR/dataset/train/images
+val: /Users/jackyzhang/ClassTranscribeOCR/dataset/valid/images
+test: /Users/jackyzhang/ClassTranscribeOCR/dataset/test/images
+
+nc: 1
+names: ['equations']
