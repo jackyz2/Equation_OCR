@@ -6,143 +6,206 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
 import torch.nn as nn
 import torch.optim as optim
-from transformers import ViTModel, ViTFeatureExtractor
+from transformers import ViTModel
 import cv2
 import numpy as np
-def visualize_bbox(image_tensor, bbox):
-    # Convert the tensor back to a NumPy array (for OpenCV)
+import xml.etree.ElementTree as ET
+
+# Collate function to handle padding of ground truth bounding boxes
+def collate_fn(batch):
+    images, boxes = zip(*batch)
+    
+    # Convert list of images to tensor
+    images = torch.stack(images)
+    
+    # Determine the maximum number of bounding boxes in the batch
+    max_boxes = max([b.size(0) for b in boxes])
+    
+    # Pad all bounding boxes to have the same number of entries
+    padded_boxes = []
+    for b in boxes:
+        num_boxes = b.size(0)
+        padding = torch.zeros((max_boxes - num_boxes, 4), dtype=torch.float32)
+        padded_boxes.append(torch.cat([b, padding], dim=0))
+    
+    # Stack all padded boxes
+    boxes = torch.stack(padded_boxes)
+    
+    return images, boxes
+
+
+# Function to visualize multiple bounding boxes
+def visualize_bboxes(image_tensor, bboxes):
     image = np.transpose(image_tensor.cpu().numpy(), (1, 2, 0))  # Convert (C, H, W) -> (H, W, C)
     image = (image * 255).astype(np.uint8)  # Denormalize the image
 
-    # Draw the predicted bounding box on the image (in red)
-    x_min, y_min, x_max, y_max = bbox
-    image_with_bbox = cv2.rectangle(image.copy(), (int(x_min), int(y_min)), (int(x_max), int(y_max)), (255, 0, 0), 2)
+    for bbox in bboxes:
+        x_min, y_min, x_max, y_max = bbox
+        image_with_bbox = cv2.rectangle(image.copy(), (int(x_min), int(y_min)), (int(x_max), int(y_max)), (255, 0, 0), 2)
 
-    # Display the image with the bounding box
     plt.imshow(image_with_bbox)
-    plt.axis('off')  # Turn off axis labels
+    plt.axis('off')
     plt.show()
 
 
-# Custom Dataset for loading image pairs
+# Custom Dataset for images and bounding boxes
 class EquationImageDataset(Dataset):
-    def __init__(self, image_dir_no_circle, image_dir_with_circle, transform=None):
-        self.image_dir_no_circle = image_dir_no_circle
-        self.image_dir_with_circle = image_dir_with_circle
+    def __init__(self, image_dir, annotation_dir, transform=None, new_size=(224, 224)):
+        self.image_dir = image_dir
+        self.annotation_dir = annotation_dir
         self.transform = transform
-        self.image_pairs = [f for f in sorted(os.listdir(image_dir_no_circle)) if f.endswith(('.png', '.jpg', '.jpeg'))]
+        self.new_size = new_size  # Target image size (224x224)
+        self.image_filenames = [f for f in sorted(os.listdir(image_dir)) if f.endswith(('.png', '.jpg', '.jpeg'))]
 
     def __len__(self):
-        return len(self.image_pairs)
+        return len(self.image_filenames)
 
     def __getitem__(self, idx):
-        img_no_circle_path = os.path.join(self.image_dir_no_circle, self.image_pairs[idx])
-        img_with_circle_path = os.path.join(self.image_dir_with_circle, self.image_pairs[idx])
+        # Load image
+        image_path = os.path.join(self.image_dir, self.image_filenames[idx])
+        img = Image.open(image_path).convert('RGB')
 
-        img_no_circle = Image.open(img_no_circle_path).convert("RGB")
-        img_with_circle = Image.open(img_with_circle_path).convert("RGB")
+        # Parse XML annotation and adjust bounding boxes
+        annotation_path = os.path.join(self.annotation_dir, self.image_filenames[idx].replace('.png', '.xml').replace('.jpg', '.xml'))
+        boxes = self.parse_xml(annotation_path, img.size)  # Pass the original image size
 
         if self.transform:
-            img_no_circle = self.transform(img_no_circle)
-            img_with_circle = self.transform(img_with_circle)
+            img = self.transform(img)
 
-        return img_no_circle, img_with_circle
+        return img, torch.as_tensor(boxes, dtype=torch.float32)
 
-# Transformation for images
+    def parse_xml(self, annotation_path, original_size):
+        tree = ET.parse(annotation_path)
+        root = tree.getroot()
+
+        original_width, original_height = original_size  # Original image dimensions
+
+        boxes = []
+        for obj in root.findall('object'):
+            bndbox = obj.find('bndbox')
+            xmin = int(bndbox.find('xmin').text)
+            ymin = int(bndbox.find('ymin').text)
+            xmax = int(bndbox.find('xmax').text)
+            ymax = int(bndbox.find('ymax').text)
+
+            # Normalize bounding box to the new size (224x224)
+            xmin = xmin * self.new_size[0] / original_width
+            ymin = ymin * self.new_size[1] / original_height
+            xmax = xmax * self.new_size[0] / original_width
+            ymax = ymax * self.new_size[1] / original_height
+
+            boxes.append([xmin, ymin, xmax, ymax])
+
+        return boxes
+
+
 transform = transforms.Compose([
-    transforms.Resize((224, 224)),  # ViT requires 224x224 images
+    transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 ])
 
-# Paths to your images
-image_dir_no_circle = '/Users/jackyzhang/ClassTranscribeOCR/testFile1'
-image_dir_with_circle = '/Users/jackyzhang/ClassTranscribeOCR/testFile2'
+# Update the paths to the image directory and XML annotations directory
+image_dir = 'testFile1'  # Images without circles
+annotation_dir = 'testFile2'  # XML annotations
 
-# Create Dataset and DataLoader
-dataset = EquationImageDataset(image_dir_no_circle, image_dir_with_circle, transform=transform)
-dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+# Create the Dataset and DataLoader
+dataset = EquationImageDataset(image_dir=image_dir, annotation_dir=annotation_dir, transform=transform)
+dataloader = DataLoader(dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)
 
-# Function to extract bounding boxes from the target image
-def extract_bboxes_from_target(image_tensor):
-    image = np.transpose(image_tensor.cpu().numpy(), (1, 2, 0))  # Convert from (C, H, W) to (H, W, C)
-    image = (image * 255).astype(np.uint8)  # Convert from normalized float back to uint8 format
+# Updated loss function to handle padding entries and mask them correctly
+def multi_box_loss(predicted_bboxes, ground_truth_bboxes, device):
+    # Create a mask for valid bounding boxes
+    mask = (ground_truth_bboxes.sum(dim=2) != 0).unsqueeze(2).to(device)  # Shape: (batch_size, num_boxes, 1)
+    
+    # Ensure predicted boxes are on the same device and have the same shape
+    predicted_bboxes = predicted_bboxes.to(device)
+    
+    # Apply the mask to only consider non-padded boxes in the loss
+    masked_predicted = predicted_bboxes * mask
+    masked_ground_truth = ground_truth_bboxes.to(device) * mask
+    
+    # Compute the loss only for valid bounding boxes
+    loss = nn.MSELoss()(masked_predicted, masked_ground_truth)
+    
+    return loss
 
-    hsv_image = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-    lower_purple = np.array([130, 50, 50])
-    upper_purple = np.array([160, 255, 255])
-    mask = cv2.inRange(hsv_image, lower_purple, upper_purple)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        x, y, w, h = cv2.boundingRect(contours[0])
-        return torch.tensor([x, y, x + w, y + h], dtype=torch.float32, device=device)
-    return torch.tensor([0, 0, 0, 0], dtype=torch.float32, device=device)
 
-# Model with regression head for bounding box prediction
-class ViTWithRegression(nn.Module):
-    def __init__(self, model):
-        super(ViTWithRegression, self).__init__()
+class ViTWithMultiBoxRegression(nn.Module):
+    def __init__(self, model, num_boxes=4):
+        super(ViTWithMultiBoxRegression, self).__init__()
         self.vit = model
-        self.regression_head = nn.Linear(model.config.hidden_size, 4)  # 4 bounding box coordinates
+        self.num_boxes = num_boxes
+        self.regression_head = nn.Linear(model.config.hidden_size, num_boxes * 4)
 
     def forward(self, pixel_values):
         outputs = self.vit(pixel_values=pixel_values)
-        bbox_coords = self.regression_head(outputs.pooler_output)  # Use pooled output
-        return bbox_coords
+        bbox_coords = self.regression_head(outputs.pooler_output)
+        return bbox_coords.view(-1, self.num_boxes, 4)
 
-# Load the pre-trained ViT model
+
+# Load the pre-trained ViT model and add a regression head
 model = ViTModel.from_pretrained("google/vit-base-patch16-224-in21k")
-model_with_regression = ViTWithRegression(model)
-
-# Move the model to the appropriate device (GPU or CPU)
+model_with_regression = ViTWithMultiBoxRegression(model, num_boxes=4)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model_with_regression.to(device)
 
-# Initialize optimizer and loss function
 optimizer = optim.AdamW(model_with_regression.parameters(), lr=1e-4)
-mse_loss = nn.MSELoss()
+
+# Load the saved model weights (ignore size mismatches for the regression head)
+def load_pretrained_vit_with_custom_head(model, model_path):
+    pretrained_dict = torch.load(model_path)
+    model_dict = model.state_dict()
+
+    # Filter out the layers that don't match the current model
+    pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict and model_dict[k].size() == v.size()}
+    model_dict.update(pretrained_dict)
+    model.load_state_dict(model_dict)
+
 
 model_path = 'model_with_regression.pth'
 if os.path.exists(model_path):
     print("Loading previously trained model...")
-    model_with_regression.load_state_dict(torch.load(model_path))
+    load_pretrained_vit_with_custom_head(model_with_regression, model_path)
 
-# Training Loop
-num_epochs = 100000
+
+# Training loop
+num_epochs = 2000
+num_boxes = 4
+
 for epoch in range(num_epochs):
     model_with_regression.train()
     running_loss = 0.0
-    
+
     for batch in dataloader:
-        img_no_circle, img_with_circle = batch
+        img_no_circle, ground_truth_bboxes = batch
         img_no_circle = img_no_circle.to(device)
+        ground_truth_bboxes = ground_truth_bboxes.to(device)
 
-        # Extract ground truth bounding boxes from the image with circles
-        ground_truth_bboxes = torch.stack([extract_bboxes_from_target(img) for img in img_with_circle], dim=0)
-
-        # Forward pass: get the predicted bounding boxes
         optimizer.zero_grad()
         predicted_bboxes = model_with_regression(img_no_circle)
 
-        # Calculate loss between predicted and ground truth bounding boxes
-        loss = mse_loss(predicted_bboxes, ground_truth_bboxes)
+        # Calculate the loss
+        loss = multi_box_loss(predicted_bboxes, ground_truth_bboxes, device)
         loss.backward()
         optimizer.step()
-
         running_loss += loss.item()
 
     print(f"Epoch {epoch+1}/{num_epochs}, Loss: {running_loss/len(dataloader)}")
+
+
     if epoch == num_epochs - 1:
         torch.save(model_with_regression.state_dict(), model_path)
         print("Model saved.")
-# After training, evaluate the model on test images to see how well it predicts bounding boxes
-    #model_with_regression.eval()
-    #with torch.no_grad():
-        #sample_img_no_circle, _ = next(iter(dataloader))
-        #sample_img_no_circle = sample_img_no_circle.to(device)
         
-        # Get the predicted bounding box for a single image
-        #predicted_bbox = model_with_regression(sample_img_no_circle[0:1]).cpu().numpy().flatten()
+        # Visualize the prediction
+        model_with_regression.eval()
+        with torch.no_grad():
+            sample_img_no_circle, _ = next(iter(dataloader))
+            sample_img_no_circle = sample_img_no_circle.to(device)
+        
+            # Get the predicted bounding boxes for a single image
+            predicted_bboxes = model_with_regression(sample_img_no_circle[0:1]).cpu().numpy().reshape(-1, 4)
 
         # Visualize the prediction on the first image of the batch
-        #visualize_bbox(sample_img_no_circle[0], predicted_bbox)
+        visualize_bboxes(sample_img_no_circle[0], predicted_bboxes)
